@@ -5,14 +5,10 @@
 #include "renderer.h"
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 
 TetrisGame::TetrisGame(TimeManager::Mode m, uint8_t queue_size)
-    : tm(TimeManager(m)), queue_size(queue_size), score(0), game_over(false) {
-    obs.board.resize(Observation::BoardH, std::vector<uint8_t>(Observation::BoardW, 0));
-    obs.active_tetromino.resize(Observation::BoardH, std::vector<uint8_t>(Observation::BoardW, 0));
-    obs.holder.resize(Tetris::PIECE_SIZE, std::vector<uint8_t>(Tetris::PIECE_SIZE, 0));
-    obs.queue.resize(queue_size * Tetris::PIECE_SIZE, std::vector<uint8_t>(Tetris::PIECE_SIZE, 0));
-
+    : tm(TimeManager(m)), queue_size(queue_size), score(0), game_over(false), obs{} {
     // Initialize queue with random pieces
     queue.resize(queue_size);
     for (int i = 0; i < queue_size; i++) {
@@ -36,45 +32,32 @@ TetrisGame::TetrisGame(TimeManager::Mode m, uint8_t queue_size)
 }
 
 void TetrisGame::reset() {
-    // Clear the board
-    for (int y = 0; y < Observation::BoardH; y++) {
-        for (int x = 0; x < Observation::BoardW; x++) {
-            obs.board[y][x] = 0;
-            obs.active_tetromino[y][x] = 0;
-        }
-    }
-    ;
-    
-    // Clear holder
-    for (int y = 0; y < Tetris::PIECE_SIZE; y++) {
-        for (int x = 0; x < Tetris::PIECE_SIZE; x++) {
-            obs.holder[y][x] = 0;
-        }
-    }
-    
+    // Zero entire observation in one shot
+    obs = {};
+
     // Reset game state
     score = 0;
     scored = 0;
     game_over = false;
     holder_type = 7;
     clearing_lines.clear();
-    
+
     // Reset queue with new random pieces
     for (int i = 0; i < queue_size; i++) {
         queue[i] = rand() % 7;
     }
     queue_index = 0;
-    
+
     // Spawn first piece
     rotation = 0;
     current_x = (Tetris::BOARD_WIDTH / 2);
     current_y = Tetris::BOARD_HEIGHT - 1;
     current_piece_type = getNextPiece();
-    
+
     if (checkCollision()) {
         game_over = true;
     }
-    
+
     updateObservation();
 }
 
@@ -118,7 +101,7 @@ void TetrisGame::applyAction(uint8_t action) {
     int old_x = current_x;
     int old_y = current_y;
     uint8_t old_rotation = rotation;
-    
+
     switch(action) {
         case Action::LEFT:
             current_x -= 1;
@@ -212,12 +195,8 @@ void TetrisGame::updateGameState() {
 }
 
 void TetrisGame::updateObservation() {
-    // Clear active_tetromino first
-    for (int y = 0; y < Observation::BoardH; y++) {
-        for (int x = 0; x < Observation::BoardW; x++) {
-            obs.active_tetromino[y][x] = 0;
-        }
-    }
+    // Clear active_tetromino in one shot
+    std::memset(obs.active_tetromino.data(), 0, sizeof(obs.active_tetromino));
 
     // Update active_tetromino at current position
     for (int y = 0; y < Tetris::PIECE_SIZE; y++) {
@@ -257,19 +236,10 @@ void TetrisGame::updateObservation() {
 }
 
 StepResult TetrisGame::step(int action) {
-    // This is the pattern
-    // apply action
     applyAction(action);
-    // update gravity, mechanics, collision, lock, clear lines
     updateGameState();
     updateObservation();
-
-    // compute reward based on the above
-    return StepResult{
-        obs,
-        getReward(),
-        game_over
-    };
+    return StepResult{getReward(), game_over};
 }
 
 bool TetrisGame::isGameOver() {
@@ -287,13 +257,13 @@ bool TetrisGame::checkCollision() {
             if (Tetris::PIECES[current_piece_type][rotation][y][x]) {
                 int board_x = current_x + x;
                 int board_y = current_y + y;
-                
+
                 // Check boundaries - use actual playable board size
                 if (board_x < 0 || board_x >= Tetris::BOARD_WIDTH ||
                     board_y < 0 || board_y >= Observation::BoardH) {
                     return true;
                 }
-                
+
                 // Check collision with existing pieces
                 if (obs.board[board_y][board_x]) {
                     return true;
@@ -330,27 +300,22 @@ void TetrisGame::lockPiece() {
 }
 
 int TetrisGame::clearLine(uint8_t row) {
-    // Shift all rows above down by one
+    // Shift rows down using array assignment (compiler optimises to memmove)
     for (int y = row; y < Tetris::BOARD_HEIGHT - 1; y++) {
-        for (int x = 0; x < Tetris::BOARD_WIDTH; x++) {
-            obs.board[y][x] = obs.board[y + 1][x];
-        }
+        obs.board[y] = obs.board[y + 1];
     }
-    // Clear the top row
-    for (int x = 0; x < Tetris::BOARD_WIDTH; x++) {
-        obs.board[Tetris::BOARD_HEIGHT - 1][x] = 0;
-    }
+    obs.board[Tetris::BOARD_HEIGHT - 1].fill(0);
     return 1;
 }
 
 int TetrisGame::clearLines() {
     clearing_lines.clear();
-    
+
     // Check rows where the current piece was placed
     for (int y = 0; y < Tetris::PIECE_SIZE; y++) {
         int row = current_y + y;
         if (row < 0 || row >= Tetris::BOARD_HEIGHT) continue;
-        
+
         // Check if this row is full
         bool is_full = true;
         for (int x = 0; x < Tetris::BOARD_WIDTH; x++) {
@@ -359,7 +324,7 @@ int TetrisGame::clearLines() {
                 break;
             }
         }
-        
+
         if (is_full) {
             clearing_lines.push_back(row);
         }

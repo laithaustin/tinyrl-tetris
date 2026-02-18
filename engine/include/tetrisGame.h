@@ -1,26 +1,32 @@
 #pragma once
+#include <array>
 #include <vector>
 #include <cstdint>
+#include "constants.h"
 #include "timeManager.h"
 
 enum Action : uint8_t {
     LEFT, RIGHT, DOWN, CW, CCW, DROP, SWAP, NOOP
 };
 
+// All fields are plain fixed-size arrays — no heap allocation, one contiguous
+// block per field, trivially copyable.
 struct Observation {
-    static constexpr int BoardW = 18;
-    static constexpr int BoardH = 24;
-    
-    std::vector<std::vector<uint8_t>> board; // 0-9 representing all forms of tetrominoes
-    std::vector<std::vector<uint8_t>> active_tetromino; // 0,1 mask for where the piece is
-    std::vector<std::vector<uint8_t>> holder;
-    std::vector<std::vector<uint8_t>> queue;
+    static constexpr int BoardW       = 18;
+    static constexpr int BoardH       = 24;
+    static constexpr int MaxQueueSize = 7;  // maximum supported queue depth
+
+    std::array<std::array<uint8_t, BoardW>, BoardH> board;
+    std::array<std::array<uint8_t, BoardW>, BoardH> active_tetromino;
+    std::array<std::array<uint8_t, Tetris::PIECE_SIZE>, Tetris::PIECE_SIZE>                       holder;
+    std::array<std::array<uint8_t, Tetris::PIECE_SIZE>, MaxQueueSize * Tetris::PIECE_SIZE>        queue;
 };
 
+// StepResult carries only the scalar outputs of a step; callers read the
+// updated observation directly from TetrisGame::obs.
 struct StepResult {
-    Observation obs;
     float reward;
-    bool terminated;
+    bool  terminated;
 };
 
 class TetrisGame {

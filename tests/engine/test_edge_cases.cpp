@@ -396,8 +396,8 @@ TEST_CASE("UpdateObservation edge cases", "[tetris][edge][observation]") {
     SECTION("Queue shows correct upcoming pieces") {
         game.updateObservation();
         
-        // Verify queue size
-        REQUIRE(game.obs.queue.size() == game.queue_size * Tetris::PIECE_SIZE);
+        // Queue has MaxQueueSize * PIECE_SIZE rows; active portion is queue_size * PIECE_SIZE
+        REQUIRE((int)game.obs.queue.size() >= game.queue_size * Tetris::PIECE_SIZE);
         
         // All queue pieces should be valid
         for (size_t i = 0; i < game.queue.size(); i++) {
