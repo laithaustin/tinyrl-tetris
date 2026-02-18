@@ -1,9 +1,11 @@
 #include <cstdint>
+#include <cstring>
 #include <memory>
 #include <pybind11/pybind11.h>
 #include <pybind11/numpy.h>
 
 #include "tetrisGame.h"
+#include "constants.h"
 
 namespace py = pybind11;
 
@@ -38,10 +40,94 @@ py::dict obs_to_dict(const Observation& obs) {
     return d;
 }
 
-PYBIND11_MODULE(tinyrl_tetris, m, py::mod_gil_not_used()) {
+// ═══════════════════════════════════════════════════════════════════════════
+// Write-through wrapper
+//
+// Pre-allocates numpy arrays once at construction time.  On every step/reset
+// the observation is copied from the C++ vector-of-vectors into those
+// fixed buffers via memcpy (one pass, no Python object allocation).
+// The same dict and the same array objects are returned on every call,
+// eliminating all per-step heap pressure.
+// ═══════════════════════════════════════════════════════════════════════════
+struct TetrisEnvWT {
+    TetrisGame game;
+    uint8_t    qs;   // queue_size
+
+    // Pre-allocated, C-contiguous numpy arrays
+    py::array_t<uint8_t> np_board;
+    py::array_t<uint8_t> np_active;
+    py::array_t<uint8_t> np_holder;
+    py::array_t<uint8_t> np_queue;
+
+    // Raw pointers into the numpy buffers (obtained once, reused every step)
+    uint8_t* board_ptr;
+    uint8_t* active_ptr;
+    uint8_t* holder_ptr;
+    uint8_t* queue_ptr;
+
+    // Pre-built dict that always references the same numpy objects
+    py::dict obs_dict;
+
+    TetrisEnvWT(TimeManager::Mode m, uint8_t queue_size)
+        : game(m, queue_size), qs(queue_size)
+    {
+        // Allocate once -------------------------------------------------
+        np_board  = py::array_t<uint8_t>({Observation::BoardH, Observation::BoardW});
+        np_active = py::array_t<uint8_t>({Observation::BoardH, Observation::BoardW});
+        np_holder = py::array_t<uint8_t>({Tetris::PIECE_SIZE,  Tetris::PIECE_SIZE});
+        np_queue  = py::array_t<uint8_t>({(int)(queue_size * Tetris::PIECE_SIZE), Tetris::PIECE_SIZE});
+
+        // Cache raw pointers (valid for the lifetime of this object)
+        board_ptr  = np_board.mutable_data();
+        active_ptr = np_active.mutable_data();
+        holder_ptr = np_holder.mutable_data();
+        queue_ptr  = np_queue.mutable_data();
+
+        // Build the dict once (always references the same array objects)
+        obs_dict["board"]            = np_board;
+        obs_dict["active_tetromino"] = np_active;
+        obs_dict["holder"]           = np_holder;
+        obs_dict["queue"]            = np_queue;
+    }
+
+    // Write the C++ observation into the pre-allocated numpy buffers via memcpy
+    inline void write_obs() {
+        const Observation& obs = game.obs;
+
+        // board and active_tetromino: BoardH rows of BoardW bytes
+        for (int y = 0; y < Observation::BoardH; y++) {
+            std::memcpy(board_ptr  + y * Observation::BoardW, obs.board[y].data(),            Observation::BoardW);
+            std::memcpy(active_ptr + y * Observation::BoardW, obs.active_tetromino[y].data(), Observation::BoardW);
+        }
+        // holder: PIECE_SIZE rows of PIECE_SIZE bytes
+        for (int y = 0; y < Tetris::PIECE_SIZE; y++) {
+            std::memcpy(holder_ptr + y * Tetris::PIECE_SIZE, obs.holder[y].data(), Tetris::PIECE_SIZE);
+        }
+        // queue: queue_size*PIECE_SIZE rows of PIECE_SIZE bytes
+        int queue_rows = qs * Tetris::PIECE_SIZE;
+        for (int y = 0; y < queue_rows; y++) {
+            std::memcpy(queue_ptr + y * Tetris::PIECE_SIZE, obs.queue[y].data(), Tetris::PIECE_SIZE);
+        }
+    }
+
+    py::dict reset() {
+        game.reset();
+        write_obs();
+        return obs_dict;
+    }
+
+    py::tuple step(int action) {
+        StepResult result = game.step(action);
+        write_obs();
+        return py::make_tuple(obs_dict, result.reward, result.terminated, py::dict());
+    }
+};
+
+
+PYBIND11_MODULE(tinyrl_tetris, m) {
     m.doc() = "TinyRL Tetris Python Bindings";
 
-    // expose TetrisGame class
+    // ── Original env (allocates new numpy arrays on every step) ──────────
     py::class_<TetrisGame>(m, "TetrisEnv")
         .def(py::init<TimeManager::Mode, uint8_t>(),
             py::arg("mode"), py::arg("queue_size") = 3)
@@ -63,6 +149,22 @@ PYBIND11_MODULE(tinyrl_tetris, m, py::mod_gil_not_used()) {
         })
         .def_readonly("score", &TetrisGame::score)
         .def_readonly("game_over", &TetrisGame::game_over);
+
+    // ── Write-through env (zero per-step allocation) ──────────────────────
+    py::class_<TetrisEnvWT>(m, "TetrisEnvWT")
+        .def(py::init<TimeManager::Mode, uint8_t>(),
+            py::arg("mode"), py::arg("queue_size") = 3)
+        .def("reset", &TetrisEnvWT::reset)
+        .def("step",  &TetrisEnvWT::step)
+        .def_property_readonly("obs", [](TetrisEnvWT& self) {
+            return self.obs_dict;
+        })
+        .def_property_readonly("score", [](TetrisEnvWT& self) {
+            return self.game.score;
+        })
+        .def_property_readonly("game_over", [](TetrisEnvWT& self) {
+            return self.game.game_over;
+        });
 
     // Expose enums
     py::enum_<Action>(m, "Action")

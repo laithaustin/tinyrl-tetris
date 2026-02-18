@@ -52,6 +52,31 @@ def _run_tinyrl(num_steps: int) -> dict:
     return {"elapsed": elapsed, "resets": resets}
 
 
+def _run_tinyrl_wt(num_steps: int) -> dict:
+    import tinyrl_tetris
+    env = tinyrl_tetris.TetrisEnvWT(tinyrl_tetris.STEPPED, queue_size=3)
+    rng = np.random.default_rng(42)
+    actions = rng.integers(0, 7, size=num_steps + WARMUP_STEPS)
+
+    env.reset()
+    # warmup
+    for i in range(WARMUP_STEPS):
+        _, _, done, _ = env.step(int(actions[i]))
+        if done:
+            env.reset()
+
+    env.reset()
+    resets = 0
+    t0 = time.perf_counter()
+    for i in range(num_steps):
+        _, _, done, _ = env.step(int(actions[WARMUP_STEPS + i]))
+        if done:
+            env.reset()
+            resets += 1
+    elapsed = time.perf_counter() - t0
+    return {"elapsed": elapsed, "resets": resets}
+
+
 def benchmark_tinyrl(num_steps: int = NUM_STEPS) -> dict:
     print("\n" + "=" * 60)
     print("BENCHMARK: TinyRL C++ Engine (single env)")
@@ -64,6 +89,20 @@ def benchmark_tinyrl(num_steps: int = NUM_STEPS) -> dict:
     print(f"  Time    : {result['elapsed']:.3f} s")
     print(f"  Speed   : {sps:,.1f} steps/sec")
     return {"name": "TinyRL C++ (single)", "steps_per_sec": sps, **result}
+
+
+def benchmark_tinyrl_wt(num_steps: int = NUM_STEPS) -> dict:
+    print("\n" + "=" * 60)
+    print("BENCHMARK: TinyRL C++ Engine – Write-Through (single env)")
+    print("=" * 60)
+
+    result = _run_tinyrl_wt(num_steps)
+    sps = num_steps / result["elapsed"]
+    print(f"  Steps   : {num_steps:,}")
+    print(f"  Episodes: {result['resets']}")
+    print(f"  Time    : {result['elapsed']:.3f} s")
+    print(f"  Speed   : {sps:,.1f} steps/sec")
+    return {"name": "TinyRL C++ Write-Through", "steps_per_sec": sps, **result}
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -132,6 +171,25 @@ def benchmark_pufferlib(num_steps: int = NUM_STEPS, num_envs: int = 1) -> dict:
 # ══════════════════════════════════════════════════════════════════════════
 # cProfile deep-dive
 # ══════════════════════════════════════════════════════════════════════════
+
+def profile_tinyrl_wt(num_steps: int = 10_000):
+    import tinyrl_tetris
+    env = tinyrl_tetris.TetrisEnvWT(tinyrl_tetris.STEPPED, queue_size=3)
+    rng = np.random.default_rng(0)
+    env.reset()
+
+    def _inner():
+        for _ in range(num_steps):
+            _, _, done, _ = env.step(int(rng.integers(0, 7)))
+            if done:
+                env.reset()
+
+    pr = cProfile.Profile()
+    pr.enable()
+    _inner()
+    pr.disable()
+    return pr
+
 
 def profile_tinyrl(num_steps: int = 10_000):
     import tinyrl_tetris
@@ -221,6 +279,7 @@ if __name__ == "__main__":
 
     # ── throughput benchmarks ──────────────────────────────────────────────
     results.append(benchmark_tinyrl())
+    results.append(benchmark_tinyrl_wt())
     results.append(benchmark_pufferlib(num_envs=1))
     results.append(benchmark_pufferlib(num_envs=16))
 
@@ -232,8 +291,10 @@ if __name__ == "__main__":
     print(f"Deep profiling ({PROFILE_STEPS:,} steps each) ...")
     print("=" * 60)
 
-    pr_tiny   = profile_tinyrl(PROFILE_STEPS)
-    pr_puffer = profile_pufferlib(PROFILE_STEPS)
+    pr_tiny    = profile_tinyrl(PROFILE_STEPS)
+    pr_tiny_wt = profile_tinyrl_wt(PROFILE_STEPS)
+    pr_puffer  = profile_pufferlib(PROFILE_STEPS)
 
-    print_profile(pr_tiny,   "TinyRL C++ Engine")
-    print_profile(pr_puffer, "PufferLib C Engine")
+    print_profile(pr_tiny,    "TinyRL C++ Engine (original)")
+    print_profile(pr_tiny_wt, "TinyRL C++ Engine (write-through)")
+    print_profile(pr_puffer,  "PufferLib C Engine")
