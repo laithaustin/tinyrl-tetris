@@ -41,3 +41,6 @@ env/
 
 # macOS
 .DS_Store
+
+# PufferLib installed resources symlink (package artifact)
+resources
