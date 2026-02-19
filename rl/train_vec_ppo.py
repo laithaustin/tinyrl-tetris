@@ -42,7 +42,7 @@ GAMMA          = 0.99
 LAMBDA         = 0.95
 CLIP_EPS       = 0.2
 VALUE_CLIP_EPS = 0.2
-ENTROPY_COEF   = 0.01
+ENTROPY_COEF   = 0.02   # higher entropy = more exploration
 VALUE_COEF     = 0.5
 EPOCHS         = 4
 MINIBATCH      = 2048
@@ -72,7 +72,12 @@ def board_metrics(board_obs):
 
     # Bumpiness: sum of absolute adjacent column height differences
     bumpiness = np.abs(heights[:, 1:] - heights[:, :-1]).sum(axis=1)   # (N,)
-    return heights, holes, bumpiness
+
+    # "Almost-complete row" count: rows with ≥8 of 10 cells filled.
+    # This gives a dense gradient toward actually clearing lines.
+    cells_per_row = (board_obs[:, :20, :10] > 0).sum(axis=2)  # (N, 20)
+    almost_full   = (cells_per_row >= 8).sum(axis=1).astype(np.float32)  # (N,)
+    return heights, holes, bumpiness, almost_full
 
 
 # ── Observation preprocessing ────────────────────────────────────────────────
@@ -177,7 +182,7 @@ def train():
     obs_np    = preprocess(obs_dict, NUM_ENVS)
 
     # Delta-shaping state: track per-env holes and max_height from last step
-    _, prev_holes, prev_bump = board_metrics(obs_dict["board"])
+    _, prev_holes, prev_bump, _ = board_metrics(obs_dict["board"])
     prev_max_h = np.zeros(NUM_ENVS, dtype=np.float32)
 
     total_steps = 0
@@ -211,19 +216,19 @@ def train():
 
             obs_dict, raw_rew, terminals = env.step(act_np)
 
-            # Reward shaping: delta-based so agent isn't penalised for past board
-            # state — only for making things worse.
+            # Reward shaping: delta-based penalties + dense "almost full row" bonus
             is_done = terminals.astype(bool)
-            heights, holes, bumpiness = board_metrics(obs_dict["board"])
+            heights, holes, bumpiness, almost_full = board_metrics(obs_dict["board"])
             max_h = heights.max(axis=1)
 
             delta_holes = holes - prev_holes          # positive = created new holes
             delta_max_h = max_h - prev_max_h          # positive = stack grew
 
             shaped = (raw_rew * 10.0                          # line clears dominate
+                      + 0.5  * almost_full                    # bonus: rows ≥8/10 filled
                       - 0.3  * np.maximum(0, delta_holes)     # penalise new holes
                       - 0.1  * np.maximum(0, delta_max_h)     # penalise growing stack
-                      - 0.01 * bumpiness)                     # prefer flat surface
+                      - 0.005 * bumpiness)                    # mild flat-surface reward
 
             # Reset shaping state for envs that just terminated
             prev_holes = np.where(is_done, 0.0, holes)
