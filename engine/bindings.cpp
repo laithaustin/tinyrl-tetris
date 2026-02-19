@@ -1,5 +1,6 @@
 #include <cstdint>
 #include <cstring>
+#include <vector>
 #include <pybind11/pybind11.h>
 #include <pybind11/numpy.h>
 
@@ -103,6 +104,108 @@ struct TetrisEnvWT {
 };
 
 
+// ═══════════════════════════════════════════════════════════════════════════
+// Vectorised write-through env
+//
+// Holds num_envs TetrisGame objects in a contiguous vector.  Pre-allocates
+// stacked (num_envs, ...) numpy arrays once.  A single Python call to step()
+// drives all envs through a tight C++ loop — one Python→C boundary crossing
+// amortised over N environments, same pattern as PufferLib's vec_step.
+// Done envs are auto-reset in-place and their obs slice overwritten.
+// ═══════════════════════════════════════════════════════════════════════════
+struct VecTetrisEnvWT {
+    int num_envs;
+    int qs;
+    std::vector<TetrisGame> envs;
+
+    // Stacked observation arrays: shape (num_envs, ...)
+    py::array_t<uint8_t> np_board;
+    py::array_t<uint8_t> np_active;
+    py::array_t<uint8_t> np_holder;
+    py::array_t<uint8_t> np_queue;
+    py::array_t<float>   np_rewards;
+    py::array_t<uint8_t> np_terminals;
+
+    uint8_t* board_ptr;
+    uint8_t* active_ptr;
+    uint8_t* holder_ptr;
+    uint8_t* queue_ptr;
+    float*   rewards_ptr;
+    uint8_t* terminals_ptr;
+
+    py::dict obs_dict;
+
+    // Per-env byte strides (flat slice size for each field)
+    int board_stride;
+    int active_stride;
+    int holder_stride;
+    int queue_stride;
+
+    VecTetrisEnvWT(TimeManager::Mode m, uint8_t queue_size, int n)
+        : num_envs(n), qs(queue_size)
+    {
+        envs.reserve(n);
+        for (int i = 0; i < n; i++)
+            envs.emplace_back(m, queue_size);
+
+        board_stride  = Observation::BoardH * Observation::BoardW;
+        active_stride = Observation::BoardH * Observation::BoardW;
+        holder_stride = Tetris::PIECE_SIZE  * Tetris::PIECE_SIZE;
+        queue_stride  = qs * Tetris::PIECE_SIZE * Tetris::PIECE_SIZE;
+
+        np_board     = py::array_t<uint8_t>({n, Observation::BoardH, Observation::BoardW});
+        np_active    = py::array_t<uint8_t>({n, Observation::BoardH, Observation::BoardW});
+        np_holder    = py::array_t<uint8_t>({n, Tetris::PIECE_SIZE,  Tetris::PIECE_SIZE});
+        np_queue     = py::array_t<uint8_t>({n, qs * Tetris::PIECE_SIZE, Tetris::PIECE_SIZE});
+        np_rewards   = py::array_t<float>  ({n});
+        np_terminals = py::array_t<uint8_t>({n});
+
+        board_ptr     = np_board.mutable_data();
+        active_ptr    = np_active.mutable_data();
+        holder_ptr    = np_holder.mutable_data();
+        queue_ptr     = np_queue.mutable_data();
+        rewards_ptr   = np_rewards.mutable_data();
+        terminals_ptr = np_terminals.mutable_data();
+
+        obs_dict["board"]            = np_board;
+        obs_dict["active_tetromino"] = np_active;
+        obs_dict["holder"]           = np_holder;
+        obs_dict["queue"]            = np_queue;
+    }
+
+    inline void write_obs_for(int i) {
+        const Observation& obs = envs[i].obs;
+        std::memcpy(board_ptr  + i * board_stride,  obs.board.data(),            board_stride);
+        std::memcpy(active_ptr + i * active_stride, obs.active_tetromino.data(), active_stride);
+        std::memcpy(holder_ptr + i * holder_stride, obs.holder.data(),           holder_stride);
+        std::memcpy(queue_ptr  + i * queue_stride,  obs.queue.data(),            queue_stride);
+    }
+
+    py::dict reset() {
+        for (int i = 0; i < num_envs; i++) {
+            envs[i].reset();
+            write_obs_for(i);
+        }
+        return obs_dict;
+    }
+
+    py::tuple step(py::array_t<int32_t, py::array::c_style | py::array::forcecast> actions) {
+        auto act = actions.unchecked<1>();
+        for (int i = 0; i < num_envs; i++) {
+            StepResult result = envs[i].step(act(i));
+            write_obs_for(i);
+            rewards_ptr[i]   = result.reward;
+            terminals_ptr[i] = result.terminated ? 1 : 0;
+            if (result.terminated) {
+                envs[i].reset();
+                write_obs_for(i);
+            }
+        }
+        return py::make_tuple(obs_dict, np_rewards, np_terminals);
+    }
+};
+
+
 PYBIND11_MODULE(tinyrl_tetris, m) {
     m.doc() = "TinyRL Tetris Python Bindings";
 
@@ -144,6 +247,17 @@ PYBIND11_MODULE(tinyrl_tetris, m) {
         .def_property_readonly("game_over", [](TetrisEnvWT& self) {
             return self.game.game_over;
         });
+
+    // ── Vectorised write-through env ─────────────────────────────────────
+    py::class_<VecTetrisEnvWT>(m, "VecTetrisEnvWT")
+        .def(py::init<TimeManager::Mode, uint8_t, int>(),
+            py::arg("mode"), py::arg("queue_size") = 3, py::arg("num_envs") = 1)
+        .def("reset", &VecTetrisEnvWT::reset)
+        .def("step",  &VecTetrisEnvWT::step)
+        .def_property_readonly("obs", [](VecTetrisEnvWT& self) {
+            return self.obs_dict;
+        })
+        .def_readonly("num_envs", &VecTetrisEnvWT::num_envs);
 
     // Expose enums
     py::enum_<Action>(m, "Action")

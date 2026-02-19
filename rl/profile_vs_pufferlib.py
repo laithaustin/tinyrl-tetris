@@ -106,6 +106,64 @@ def benchmark_tinyrl_wt(num_steps: int = NUM_STEPS) -> dict:
 
 
 # ══════════════════════════════════════════════════════════════════════════
+# TinyRL vec-env benchmark helpers
+# ══════════════════════════════════════════════════════════════════════════
+
+def _run_tinyrl_vec(num_steps: int, num_envs: int) -> dict:
+    import tinyrl_tetris
+    env = tinyrl_tetris.VecTetrisEnvWT(tinyrl_tetris.STEPPED, queue_size=3, num_envs=num_envs)
+    rng = np.random.default_rng(42)
+    pre_actions = rng.integers(0, 7, size=(num_steps + WARMUP_STEPS, num_envs), dtype=np.int32)
+
+    env.reset()
+    for i in range(WARMUP_STEPS):
+        env.step(pre_actions[i])
+
+    env.reset()
+    total_episodes = 0
+    t0 = time.perf_counter()
+    for i in range(num_steps):
+        _, rewards, terminals = env.step(pre_actions[WARMUP_STEPS + i])
+        total_episodes += int(terminals.sum())
+    elapsed = time.perf_counter() - t0
+    return {"elapsed": elapsed, "resets": total_episodes}
+
+
+def benchmark_tinyrl_vec(num_steps: int = NUM_STEPS, num_envs: int = 1) -> dict:
+    label = f"TinyRL VecWT (num_envs={num_envs})"
+    print("\n" + "=" * 60)
+    print(f"BENCHMARK: {label}")
+    print("=" * 60)
+
+    result = _run_tinyrl_vec(num_steps, num_envs)
+    total_env_steps = num_steps * num_envs
+    sps = total_env_steps / result["elapsed"]
+    print(f"  Steps   : {total_env_steps:,}  ({num_steps} calls × {num_envs} envs)")
+    print(f"  Episodes: {result['resets']}")
+    print(f"  Time    : {result['elapsed']:.3f} s")
+    print(f"  Speed   : {sps:,.1f} steps/sec")
+    return {"name": label, "steps_per_sec": sps, **result}
+
+
+def profile_tinyrl_vec(num_steps: int = 10_000, num_envs: int = 16):
+    import tinyrl_tetris
+    env = tinyrl_tetris.VecTetrisEnvWT(tinyrl_tetris.STEPPED, queue_size=3, num_envs=num_envs)
+    rng = np.random.default_rng(0)
+    pre_actions = rng.integers(0, 7, size=(num_steps, num_envs), dtype=np.int32)
+    env.reset()
+
+    def _inner():
+        for i in range(num_steps):
+            env.step(pre_actions[i])
+
+    pr = cProfile.Profile()
+    pr.enable()
+    _inner()
+    pr.disable()
+    return pr
+
+
+# ══════════════════════════════════════════════════════════════════════════
 # PufferLib benchmark helpers
 # ══════════════════════════════════════════════════════════════════════════
 
@@ -280,6 +338,9 @@ if __name__ == "__main__":
     # ── throughput benchmarks ──────────────────────────────────────────────
     results.append(benchmark_tinyrl())
     results.append(benchmark_tinyrl_wt())
+    results.append(benchmark_tinyrl_vec(num_envs=1))
+    results.append(benchmark_tinyrl_vec(num_envs=16))
+    results.append(benchmark_tinyrl_vec(num_envs=64))
     results.append(benchmark_pufferlib(num_envs=1))
     results.append(benchmark_pufferlib(num_envs=16))
 
@@ -293,8 +354,10 @@ if __name__ == "__main__":
 
     pr_tiny    = profile_tinyrl(PROFILE_STEPS)
     pr_tiny_wt = profile_tinyrl_wt(PROFILE_STEPS)
+    pr_tiny_v  = profile_tinyrl_vec(PROFILE_STEPS, num_envs=16)
     pr_puffer  = profile_pufferlib(PROFILE_STEPS)
 
     print_profile(pr_tiny,    "TinyRL C++ Engine (original)")
-    print_profile(pr_tiny_wt, "TinyRL C++ Engine (write-through)")
+    print_profile(pr_tiny_wt, "TinyRL C++ Engine (write-through, 1 env)")
+    print_profile(pr_tiny_v,  "TinyRL VecWT (16 envs)")
     print_profile(pr_puffer,  "PufferLib C Engine")
