@@ -3,12 +3,11 @@ Vectorised PPO for TinyRL Tetris using VecTetrisEnvWT.
 
 64 environments run inside one C++ loop per Python call.
 Reward shaping on top of raw line-clear reward:
-  +0.01 / step  (survival)
   -0.05 * max(0, Δholes)   (penalise creating holes)
   -0.01 * max(0, Δmax_height)  (penalise growing the stack)
 """
 
-import sys, time, collections
+import sys, time, collections, argparse
 from pathlib import Path
 
 import numpy as np
@@ -20,12 +19,25 @@ from torch.distributions import Categorical
 sys.path.insert(0, str(Path(__file__).parent.parent / "engine" / "build" / "lib"))
 import tinyrl_tetris
 
-# ── Hyperparameters ──────────────────────────────────────────────────────────
-NUM_ENVS          = 64
-STEPS_PER_ROLLOUT = 256          # per env → 64*256 = 16 384 transitions/update
-TOTAL_TIMESTEPS   = 20_000_000
-QUEUE_SIZE        = 3
+# ── CLI ───────────────────────────────────────────────────────────────────────
+def parse_args():
+    p = argparse.ArgumentParser(description="Vectorised PPO for TinyRL Tetris")
+    p.add_argument("--timesteps", type=int, default=2_000_000,
+                   help="Total environment steps (default: 2_000_000)")
+    p.add_argument("--save", type=str, default="models/ppo_tetris.pt",
+                   help="Path to save the final model")
+    p.add_argument("--checkpoint-every", type=int, default=0,
+                   help="Save checkpoint every N updates (0 = disabled)")
+    p.add_argument("--num-envs", type=int, default=64)
+    p.add_argument("--steps-per-rollout", type=int, default=256)
+    p.add_argument("--hidden", type=int, default=256)
+    p.add_argument("--lr", type=float, default=3e-4)
+    p.add_argument("--seed", type=int, default=42)
+    return p.parse_args()
 
+
+# ── Hyperparameters ──────────────────────────────────────────────────────────
+QUEUE_SIZE     = 3
 GAMMA          = 0.99
 LAMBDA         = 0.95
 CLIP_EPS       = 0.2
@@ -34,16 +46,10 @@ ENTROPY_COEF   = 0.01
 VALUE_COEF     = 0.5
 EPOCHS         = 4
 MINIBATCH      = 2048
-LR             = 3e-4
-HIDDEN         = 256
 MAX_GRAD_NORM  = 0.5
-
 REPORT_EVERY   = 10   # updates between progress prints
 
-# Observation only uses the playable region + piece info
 STATE_DIM = 20*10 + 20*10 + QUEUE_SIZE*4*4 + 4*4   # 464
-
-NUM_UPDATES = TOTAL_TIMESTEPS // (NUM_ENVS * STEPS_PER_ROLLOUT)
 
 
 # ── Board metrics (for reward shaping) ──────────────────────────────────────
@@ -122,23 +128,43 @@ def compute_gae(rewards, dones, values, next_value, gamma, lam):
     return adv, adv + values
 
 
+def save_model(model, path, metadata=None):
+    """Save model weights and optional metadata."""
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    payload = {"model_state": model.state_dict()}
+    if metadata:
+        payload["metadata"] = metadata
+    torch.save(payload, path)
+    print(f"  [saved → {path}]")
+
+
 # ── Training ─────────────────────────────────────────────────────────────────
 def train():
+    args = parse_args()
+    torch.manual_seed(args.seed)
+    np.random.seed(args.seed)
+
+    NUM_ENVS          = args.num_envs
+    STEPS_PER_ROLLOUT = args.steps_per_rollout
+    TOTAL_TIMESTEPS   = args.timesteps
+    NUM_UPDATES       = TOTAL_TIMESTEPS // (NUM_ENVS * STEPS_PER_ROLLOUT)
+
     print("=" * 65)
     print("TinyRL Tetris — Vectorised PPO")
     print(f"  envs={NUM_ENVS}  steps/rollout={STEPS_PER_ROLLOUT}  "
           f"batch={NUM_ENVS*STEPS_PER_ROLLOUT:,}")
     print(f"  total_timesteps={TOTAL_TIMESTEPS:,}  updates={NUM_UPDATES}")
-    print(f"  state_dim={STATE_DIM}  hidden={HIDDEN}  lr={LR}")
+    print(f"  state_dim={STATE_DIM}  hidden={args.hidden}  lr={args.lr}")
+    print(f"  save_path={args.save}")
     print("=" * 65)
 
     env   = tinyrl_tetris.VecTetrisEnvWT(tinyrl_tetris.STEPPED, QUEUE_SIZE, NUM_ENVS)
-    model = ActorCritic(STATE_DIM, 7, HIDDEN)
-    opt   = optim.Adam(model.parameters(), lr=LR, eps=1e-5)
+    model = ActorCritic(STATE_DIM, 7, args.hidden)
+    opt   = optim.Adam(model.parameters(), lr=args.lr, eps=1e-5)
 
     # Episode tracking
-    ep_shaped = np.zeros(NUM_ENVS, dtype=np.float32)  # shaped return accumulator
-    ep_score  = np.zeros(NUM_ENVS, dtype=np.float32)  # raw line-clears accumulator
+    ep_shaped = np.zeros(NUM_ENVS, dtype=np.float32)
+    ep_score  = np.zeros(NUM_ENVS, dtype=np.float32)
     ep_len    = np.zeros(NUM_ENVS, dtype=np.int32)
     shaped_buf = collections.deque(maxlen=400)
     score_buf  = collections.deque(maxlen=400)
@@ -259,6 +285,11 @@ def train():
             print(f"{update+1:7d} {total_steps:>11,} {sps:>8,.0f} "
                   f"{mr:>8.2f} {ms:>9.2f} {ml:>7.0f} {loss_val:>8.4f}")
 
+        # Checkpoint
+        if args.checkpoint_every and (update + 1) % args.checkpoint_every == 0:
+            ckpt = Path(args.save).with_suffix(f".ckpt{update+1}.pt")
+            save_model(model, str(ckpt), {"update": update+1, "total_steps": total_steps})
+
     elapsed = time.perf_counter() - t0
     print("-" * 65)
     print(f"\nDone: {total_steps:,} steps in {elapsed:.1f}s  "
@@ -268,6 +299,17 @@ def train():
               f"ep_score={np.mean(score_buf):.2f}  "
               f"ep_len={np.mean(len_buf):.0f}  "
               f"ep_ret={np.mean(shaped_buf):.2f}")
+
+    # Save final model
+    save_model(model, args.save, {
+        "total_steps": total_steps,
+        "state_dim": STATE_DIM,
+        "action_dim": 7,
+        "hidden": args.hidden,
+        "queue_size": QUEUE_SIZE,
+        "ep_score_mean": float(np.mean(score_buf)) if score_buf else 0.0,
+        "ep_len_mean":   float(np.mean(len_buf))   if len_buf   else 0.0,
+    })
 
 
 if __name__ == "__main__":
