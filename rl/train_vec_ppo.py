@@ -46,6 +46,9 @@ def parse_args():
     p.add_argument("--entropy-end", type=float, default=0.002,
                    help="Entropy coefficient at final step (linear decay)")
     p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--start-update", type=int, default=0,
+                   help="Offset for LR/entropy schedules when resuming mid-run "
+                        "(set to the update number of the loaded checkpoint)")
     return p.parse_args()
 
 
@@ -322,13 +325,15 @@ def train():
 
         adv_f = (adv_f - adv_f.mean()) / (adv_f.std() + 1e-8)
 
-        # LR schedule: linear decay to 0
-        frac = 1.0 - update / NUM_UPDATES
+        # LR schedule: linear decay to 0 (offset by start_update for mid-run resumes)
+        effective_update = update + args.start_update
+        total_updates    = NUM_UPDATES + args.start_update
+        frac = 1.0 - effective_update / total_updates
         for pg in opt.param_groups:
             pg["lr"] = args.lr * frac
 
         # Entropy annealing: linear decay from entropy_start to entropy_end
-        entropy_coef = args.entropy_start + (args.entropy_end - args.entropy_start) * (update / max(1, NUM_UPDATES - 1))
+        entropy_coef = args.entropy_start + (args.entropy_end - args.entropy_start) * (effective_update / max(1, total_updates - 1))
 
         # PPO update
         loss_val = 0.0
