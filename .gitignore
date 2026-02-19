@@ -44,3 +44,6 @@ env/
 
 # PufferLib installed resources symlink (package artifact)
 resources
+
+# Training logs (live output, not versioned)
+*.log
