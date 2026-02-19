@@ -56,8 +56,8 @@ LAMBDA         = 0.95
 CLIP_EPS       = 0.2
 VALUE_CLIP_EPS = 0.2
 VALUE_COEF     = 0.5
-EPOCHS         = 4
-MINIBATCH      = 2048
+EPOCHS         = 2
+MINIBATCH      = 4096
 MAX_GRAD_NORM  = 0.5
 REPORT_EVERY   = 10   # updates between progress prints
 
@@ -93,13 +93,33 @@ def board_metrics(board_obs):
 
 
 # ── Observation preprocessing ────────────────────────────────────────────────
+# Slice offsets into the flat STATE_DIM=464 vector
+_B  = 20 * 10   # 200: board cells
+_A  = 20 * 10   # 200: active tetromino cells
+_Q  = 3 * 4 * 4 # 48:  queue pieces (QUEUE_SIZE × 4×4)
+_H  = 4 * 4     # 16:  holder piece
+_B0, _B1 = 0,       _B          # board
+_A0, _A1 = _B1,     _B1 + _A    # active
+_Q0, _Q1 = _A1,     _A1 + _Q    # queue
+_H0, _H1 = _Q1,     _Q1 + _H    # holder
+
+
+def preprocess_into(obs_dict, n, out):
+    """Write flattened normalised obs directly into pre-allocated (N, STATE_DIM) buffer."""
+    np.divide(obs_dict["board"][:, :20, :10].reshape(n, _B),   7.0,
+              out=out[:, _B0:_B1], casting="unsafe")
+    out[:, _A0:_A1] = obs_dict["active_tetromino"][:, :20, :10].reshape(n, _A)
+    np.divide(obs_dict["queue"].reshape(n, _Q),  7.0,
+              out=out[:, _Q0:_Q1], casting="unsafe")
+    np.divide(obs_dict["holder"].reshape(n, _H), 7.0,
+              out=out[:, _H0:_H1], casting="unsafe")
+
+
 def preprocess(obs_dict, n):
-    """Flatten and normalise the dict obs to (N, STATE_DIM) float32."""
-    board  = obs_dict["board"][:, :20, :10].reshape(n, -1).astype(np.float32) / 7.0
-    active = obs_dict["active_tetromino"][:, :20, :10].reshape(n, -1).astype(np.float32)
-    queue  = obs_dict["queue"].reshape(n, -1).astype(np.float32) / 7.0
-    holder = obs_dict["holder"].reshape(n, -1).astype(np.float32) / 7.0
-    return np.concatenate([board, active, queue, holder], axis=1)   # (N,464)
+    """Allocating version — used for compatibility (e.g. smoke tests)."""
+    out = np.empty((n, STATE_DIM), dtype=np.float32)
+    preprocess_into(obs_dict, n, out)
+    return out
 
 
 # ── Model ────────────────────────────────────────────────────────────────────
@@ -175,8 +195,9 @@ def train():
           f"batch={NUM_ENVS*STEPS_PER_ROLLOUT:,}")
     print(f"  total_timesteps={TOTAL_TIMESTEPS:,}  updates={NUM_UPDATES}")
     print(f"  state_dim={STATE_DIM}  hidden={args.hidden}  lr={args.lr} (linear→0)")
-    print(f"  entropy={args.entropy_start}→{args.entropy_end} (linear decay)")
+    print(f"  entropy={args.entropy_start}→{args.entropy_end}  epochs={EPOCHS}  minibatch={MINIBATCH}")
     print(f"  load={args.load or 'none'}  save={args.save}")
+    print(f"  inference_mode=ON  zero_grad(set_to_none=True)  epochs={EPOCHS}  mb={MINIBATCH}")
     print("=" * 72)
 
     env   = tinyrl_tetris.VecTetrisEnvWT(tinyrl_tetris.STEPPED, QUEUE_SIZE, NUM_ENVS)
@@ -196,6 +217,9 @@ def train():
             print(f"  [WARNING: shape mismatch loading {args.load}: {e}]")
             print("  [starting from scratch with new architecture]")
 
+    # torch.compile skipped — adds overhead on CPU-only (no CUDA graphs benefit)
+    pass
+
     # Episode tracking
     ep_shaped = np.zeros(NUM_ENVS, dtype=np.float32)
     ep_score  = np.zeros(NUM_ENVS, dtype=np.float32)
@@ -205,7 +229,9 @@ def train():
     len_buf    = collections.deque(maxlen=400)
 
     obs_dict  = env.reset()
-    obs_np    = preprocess(obs_dict, NUM_ENVS)
+    # Persistent obs buffer — reused every step to avoid repeated np.concatenate allocs
+    obs_np = np.empty((NUM_ENVS, STATE_DIM), dtype=np.float32)
+    preprocess_into(obs_dict, NUM_ENVS, obs_np)
 
     # Delta-shaping state: track per-env holes and max_height from last step
     _, prev_holes, prev_bump, _ = board_metrics(obs_dict["board"])
@@ -214,24 +240,24 @@ def train():
     total_steps = 0
     t0 = time.perf_counter()
 
+    # Pre-allocate rollout buffers once (avoids per-update malloc)
+    T, N = STEPS_PER_ROLLOUT, NUM_ENVS
+    obs_buf  = np.empty((T, N, STATE_DIM), dtype=np.float32)
+    act_buf  = np.empty((T, N),            dtype=np.int64)
+    logp_buf = np.empty((T, N),            dtype=np.float32)
+    val_buf  = np.empty((T, N),            dtype=np.float32)
+    rew_buf  = np.empty((T, N),            dtype=np.float32)
+    done_buf = np.empty((T, N),            dtype=np.float32)
+
     print(f"\n{'Update':>7} {'Steps':>11} {'SPS':>8} "
           f"{'ep_ret':>8} {'ep_score':>9} {'ep_len':>7} {'loss':>8} {'ent':>6}")
     print("-" * 72)
 
     for update in range(NUM_UPDATES):
-        # ── Rollout buffers ──────────────────────────────────────────────
-        T, N = STEPS_PER_ROLLOUT, NUM_ENVS
-        obs_buf  = np.empty((T, N, STATE_DIM), dtype=np.float32)
-        act_buf  = np.empty((T, N),            dtype=np.int64)
-        logp_buf = np.empty((T, N),            dtype=np.float32)
-        val_buf  = np.empty((T, N),            dtype=np.float32)
-        rew_buf  = np.empty((T, N),            dtype=np.float32)
-        done_buf = np.empty((T, N),            dtype=np.float32)
-
         for step in range(T):
             obs_buf[step] = obs_np
 
-            with torch.no_grad():
+            with torch.inference_mode():
                 acts, lps, _, vals = model.get_action_and_value(
                     torch.from_numpy(obs_np))
 
@@ -263,7 +289,7 @@ def train():
             rew_buf[step]  = shaped
             done_buf[step] = terminals.astype(np.float32)
 
-            obs_np = preprocess(obs_dict, NUM_ENVS)
+            preprocess_into(obs_dict, NUM_ENVS, obs_np)
 
             # Episode bookkeeping
             ep_shaped += shaped
@@ -278,7 +304,7 @@ def train():
         total_steps += T * N
 
         # Bootstrap
-        with torch.no_grad():
+        with torch.inference_mode():
             _, _, _, nv = model.get_action_and_value(torch.from_numpy(obs_np))
         next_val = nv.numpy()
 
@@ -324,7 +350,7 @@ def train():
                 el = -ent.mean()
 
                 loss = pg + VALUE_COEF * vl + entropy_coef * el
-                opt.zero_grad()
+                opt.zero_grad(set_to_none=True)
                 loss.backward()
                 nn.utils.clip_grad_norm_(model.parameters(), MAX_GRAD_NORM)
                 opt.step()
