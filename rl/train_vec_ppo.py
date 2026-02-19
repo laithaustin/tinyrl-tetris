@@ -56,7 +56,7 @@ STATE_DIM = 20*10 + 20*10 + QUEUE_SIZE*4*4 + 4*4   # 464
 def board_metrics(board_obs):
     """
     board_obs : (N, 24, 18) uint8, row-0 = bottom, cols 0:10 are the playfield.
-    Returns heights (N,10), holes (N,) — all float32.
+    Returns heights (N,10), holes (N,), bumpiness (N,) — all float32.
     """
     b = (board_obs[:, :20, :10] > 0)          # (N,20,10) bool, row-0 = bottom
     col_any = b.any(axis=1)                    # (N,10)
@@ -69,7 +69,10 @@ def board_metrics(board_obs):
     has_above = np.zeros_like(b, dtype=np.float32)
     has_above[:, :-1, :] = cum_above[:, 1:, :].astype(np.float32)
     holes = ((has_above > 0) & ~b).sum(axis=(1, 2)).astype(np.float32)  # (N,)
-    return heights, holes
+
+    # Bumpiness: sum of absolute adjacent column height differences
+    bumpiness = np.abs(heights[:, 1:] - heights[:, :-1]).sum(axis=1)   # (N,)
+    return heights, holes, bumpiness
 
 
 # ── Observation preprocessing ────────────────────────────────────────────────
@@ -173,6 +176,10 @@ def train():
     obs_dict  = env.reset()
     obs_np    = preprocess(obs_dict, NUM_ENVS)
 
+    # Delta-shaping state: track per-env holes and max_height from last step
+    _, prev_holes, prev_bump = board_metrics(obs_dict["board"])
+    prev_max_h = np.zeros(NUM_ENVS, dtype=np.float32)
+
     total_steps = 0
     t0 = time.perf_counter()
 
@@ -204,14 +211,23 @@ def train():
 
             obs_dict, raw_rew, terminals = env.step(act_np)
 
-            # Reward shaping
+            # Reward shaping: delta-based so agent isn't penalised for past board
+            # state — only for making things worse.
             is_done = terminals.astype(bool)
-            heights, holes = board_metrics(obs_dict["board"])
-            max_h   = heights.max(axis=1)
+            heights, holes, bumpiness = board_metrics(obs_dict["board"])
+            max_h = heights.max(axis=1)
 
-            shaped = (raw_rew * 10.0    # line clears dominate
-                      - 0.02 * holes     # absolute hole count (continuous penalty)
-                      - 0.001 * max_h)   # absolute height (keeps stack low)
+            delta_holes = holes - prev_holes          # positive = created new holes
+            delta_max_h = max_h - prev_max_h          # positive = stack grew
+
+            shaped = (raw_rew * 10.0                          # line clears dominate
+                      - 0.3  * np.maximum(0, delta_holes)     # penalise new holes
+                      - 0.1  * np.maximum(0, delta_max_h)     # penalise growing stack
+                      - 0.01 * bumpiness)                     # prefer flat surface
+
+            # Reset shaping state for envs that just terminated
+            prev_holes = np.where(is_done, 0.0, holes)
+            prev_max_h = np.where(is_done, 0.0, max_h)
 
             rew_buf[step]  = shaped
             done_buf[step] = terminals.astype(np.float32)

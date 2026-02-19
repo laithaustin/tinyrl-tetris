@@ -71,4 +71,5 @@ public:
     int8_t current_y;
     uint8_t current_piece_type;
     uint8_t rotation; // 0-3 possible options
+    bool can_swap;    // standard Tetris rule: only one swap per piece placement
 };

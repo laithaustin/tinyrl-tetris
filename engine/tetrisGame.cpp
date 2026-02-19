@@ -8,7 +8,7 @@
 #include <cstring>
 
 TetrisGame::TetrisGame(TimeManager::Mode m, uint8_t queue_size)
-    : tm(TimeManager(m)), queue_size(queue_size), score(0), game_over(false), obs{} {
+    : tm(TimeManager(m)), queue_size(queue_size), score(0), game_over(false), obs{}, can_swap(true) {
     // Initialize queue with random pieces
     queue.resize(queue_size);
     for (int i = 0; i < queue_size; i++) {
@@ -40,6 +40,7 @@ void TetrisGame::reset() {
     scored = 0;
     game_over = false;
     holder_type = 7;
+    can_swap = true;
     clearing_lines.clear();
 
     // Reset queue with new random pieces
@@ -142,13 +143,16 @@ void TetrisGame::applyAction(uint8_t action) {
             lockPiece();
             scored = clearLines();
             score += scored;
+            completeClearLines();  // actually erase the marked rows
             spawnPiece();
             if (checkCollision()) {
                 game_over = true;
             }
             break;
         case Action::SWAP:
-            // Swap with hold piece
+            // Standard Tetris rule: only one swap allowed per piece
+            if (!can_swap) break;
+            can_swap = false;
             if (holder_type == 7) {
                 // No piece in holder, just move current piece there
                 holder_type = current_piece_type;
@@ -281,6 +285,7 @@ void TetrisGame::spawnPiece() {
     current_x = (Tetris::BOARD_WIDTH / 2);
     current_y = Tetris::BOARD_HEIGHT - 1;
     rotation = 0;
+    can_swap = true;  // reset swap allowance for each new piece
 }
 
 void TetrisGame::lockPiece() {
