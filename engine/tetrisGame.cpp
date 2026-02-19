@@ -183,9 +183,10 @@ void TetrisGame::updateGameState() {
         current_y += 1;  // Restore position before locking
         // lock piece
         lockPiece();
-        // clear lines
+        // detect and immediately clear full lines
         scored = clearLines();
         score += scored;
+        completeClearLines();
         // spawn new piece
         spawnPiece();
         if (checkCollision()) {
@@ -335,9 +336,9 @@ int TetrisGame::clearLines() {
 }
 
 void TetrisGame::completeClearLines() {
-    // Actually clear the marked lines
-    for (int row : clearing_lines) {
-        clearLine(row);
+    // Clear from highest row downward so row-shift doesn't invalidate lower indices
+    for (int i = (int)clearing_lines.size() - 1; i >= 0; i--) {
+        clearLine(clearing_lines[i]);
     }
     clearing_lines.clear();
 }
