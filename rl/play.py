@@ -105,7 +105,7 @@ def render_board(obs_dict, score, lines, action_name, step):
 
 
 # ── Evaluation loop ───────────────────────────────────────────────────────────
-def evaluate(model_or_none, num_episodes, greedy, render, render_delay):
+def evaluate(model_or_none, num_episodes, greedy, render, render_delay, max_steps=50_000):
     env = tinyrl_tetris.TetrisEnvWT(tinyrl_tetris.STEPPED, QUEUE_SIZE)
 
     ep_scores  = []
@@ -134,7 +134,7 @@ def evaluate(model_or_none, num_episodes, greedy, render, render_delay):
             score += reward
             step  += 1
 
-            if done:
+            if done or step >= max_steps:
                 break
 
         ep_scores.append(score)
@@ -173,6 +173,8 @@ def parse_args():
                    help="Render each step to the terminal")
     p.add_argument("--render-delay", type=float, default=0.05,
                    help="Seconds between rendered frames (default: 0.05)")
+    p.add_argument("--max-steps", type=int, default=50_000,
+                   help="Max steps per episode to prevent infinite loops (default: 50_000)")
     return p.parse_args()
 
 
@@ -201,7 +203,7 @@ def main():
         print(f"  policy={policy}  episodes={args.episodes}")
 
     print()
-    evaluate(model, args.episodes, args.greedy, args.render, args.render_delay)
+    evaluate(model, args.episodes, args.greedy, args.render, args.render_delay, args.max_steps)
 
 
 if __name__ == "__main__":
