@@ -1,10 +1,17 @@
 """
 Vectorised PPO for TinyRL Tetris using VecTetrisEnvWT.
 
-64 environments run inside one C++ loop per Python call.
+64+ environments run inside one C++ loop per Python call.
 Reward shaping on top of raw line-clear reward:
-  -0.05 * max(0, Δholes)   (penalise creating holes)
-  -0.01 * max(0, Δmax_height)  (penalise growing the stack)
+  -0.3  * max(0, Δholes)      (penalise creating holes)
+  -0.1  * max(0, Δmax_height) (penalise growing the stack)
+  +0.5  * almost_full_rows    (dense gradient toward line clears)
+  -0.005 * bumpiness          (mild flat-surface incentive)
+
+Supports:
+  --load   : resume training from an existing checkpoint
+  LR schedule  : linear decay to 0 over training
+  Entropy schedule : linear decay from --entropy-start to --entropy-end
 """
 
 import sys, time, collections, argparse
@@ -26,12 +33,18 @@ def parse_args():
                    help="Total environment steps (default: 2_000_000)")
     p.add_argument("--save", type=str, default="models/ppo_tetris.pt",
                    help="Path to save the final model")
+    p.add_argument("--load", type=str, default=None,
+                   help="Resume training from this checkpoint")
     p.add_argument("--checkpoint-every", type=int, default=0,
                    help="Save checkpoint every N updates (0 = disabled)")
-    p.add_argument("--num-envs", type=int, default=64)
-    p.add_argument("--steps-per-rollout", type=int, default=256)
-    p.add_argument("--hidden", type=int, default=256)
+    p.add_argument("--num-envs", type=int, default=128)
+    p.add_argument("--steps-per-rollout", type=int, default=512)
+    p.add_argument("--hidden", type=int, default=512)
     p.add_argument("--lr", type=float, default=3e-4)
+    p.add_argument("--entropy-start", type=float, default=0.02,
+                   help="Entropy coefficient at step 0")
+    p.add_argument("--entropy-end", type=float, default=0.002,
+                   help="Entropy coefficient at final step (linear decay)")
     p.add_argument("--seed", type=int, default=42)
     return p.parse_args()
 
@@ -42,7 +55,6 @@ GAMMA          = 0.99
 LAMBDA         = 0.95
 CLIP_EPS       = 0.2
 VALUE_CLIP_EPS = 0.2
-ENTROPY_COEF   = 0.02   # higher entropy = more exploration
 VALUE_COEF     = 0.5
 EPOCHS         = 4
 MINIBATCH      = 2048
@@ -157,18 +169,32 @@ def train():
     TOTAL_TIMESTEPS   = args.timesteps
     NUM_UPDATES       = TOTAL_TIMESTEPS // (NUM_ENVS * STEPS_PER_ROLLOUT)
 
-    print("=" * 65)
+    print("=" * 72)
     print("TinyRL Tetris — Vectorised PPO")
     print(f"  envs={NUM_ENVS}  steps/rollout={STEPS_PER_ROLLOUT}  "
           f"batch={NUM_ENVS*STEPS_PER_ROLLOUT:,}")
     print(f"  total_timesteps={TOTAL_TIMESTEPS:,}  updates={NUM_UPDATES}")
-    print(f"  state_dim={STATE_DIM}  hidden={args.hidden}  lr={args.lr}")
-    print(f"  save_path={args.save}")
-    print("=" * 65)
+    print(f"  state_dim={STATE_DIM}  hidden={args.hidden}  lr={args.lr} (linear→0)")
+    print(f"  entropy={args.entropy_start}→{args.entropy_end} (linear decay)")
+    print(f"  load={args.load or 'none'}  save={args.save}")
+    print("=" * 72)
 
     env   = tinyrl_tetris.VecTetrisEnvWT(tinyrl_tetris.STEPPED, QUEUE_SIZE, NUM_ENVS)
     model = ActorCritic(STATE_DIM, 7, args.hidden)
     opt   = optim.Adam(model.parameters(), lr=args.lr, eps=1e-5)
+
+    # Resume from checkpoint if requested
+    steps_offset = 0
+    if args.load:
+        payload = torch.load(args.load, map_location="cpu", weights_only=False)
+        # Load weights — allow size mismatch (e.g. different hidden) gracefully
+        state = payload["model_state"]
+        try:
+            model.load_state_dict(state)
+            print(f"  [resumed weights from {args.load}]")
+        except RuntimeError as e:
+            print(f"  [WARNING: shape mismatch loading {args.load}: {e}]")
+            print("  [starting from scratch with new architecture]")
 
     # Episode tracking
     ep_shaped = np.zeros(NUM_ENVS, dtype=np.float32)
@@ -189,8 +215,8 @@ def train():
     t0 = time.perf_counter()
 
     print(f"\n{'Update':>7} {'Steps':>11} {'SPS':>8} "
-          f"{'ep_ret':>8} {'ep_score':>9} {'ep_len':>7} {'loss':>8}")
-    print("-" * 65)
+          f"{'ep_ret':>8} {'ep_score':>9} {'ep_len':>7} {'loss':>8} {'ent':>6}")
+    print("-" * 72)
 
     for update in range(NUM_UPDATES):
         # ── Rollout buffers ──────────────────────────────────────────────
@@ -270,6 +296,14 @@ def train():
 
         adv_f = (adv_f - adv_f.mean()) / (adv_f.std() + 1e-8)
 
+        # LR schedule: linear decay to 0
+        frac = 1.0 - update / NUM_UPDATES
+        for pg in opt.param_groups:
+            pg["lr"] = args.lr * frac
+
+        # Entropy annealing: linear decay from entropy_start to entropy_end
+        entropy_coef = args.entropy_start + (args.entropy_end - args.entropy_start) * (update / max(1, NUM_UPDATES - 1))
+
         # PPO update
         loss_val = 0.0
         for _ in range(EPOCHS):
@@ -289,7 +323,7 @@ def train():
                                       (v_clip - ret_f[idx]).pow(2)).mean()
                 el = -ent.mean()
 
-                loss = pg + VALUE_COEF * vl + ENTROPY_COEF * el
+                loss = pg + VALUE_COEF * vl + entropy_coef * el
                 opt.zero_grad()
                 loss.backward()
                 nn.utils.clip_grad_norm_(model.parameters(), MAX_GRAD_NORM)
@@ -304,7 +338,7 @@ def train():
             ms  = np.mean(score_buf)  if score_buf  else 0.0
             ml  = np.mean(len_buf)    if len_buf     else 0.0
             print(f"{update+1:7d} {total_steps:>11,} {sps:>8,.0f} "
-                  f"{mr:>8.2f} {ms:>9.2f} {ml:>7.0f} {loss_val:>8.4f}")
+                  f"{mr:>8.2f} {ms:>9.2f} {ml:>7.0f} {loss_val:>8.4f} {entropy_coef:>6.4f}")
 
         # Checkpoint
         if args.checkpoint_every and (update + 1) % args.checkpoint_every == 0:
@@ -312,7 +346,7 @@ def train():
             save_model(model, str(ckpt), {"update": update+1, "total_steps": total_steps})
 
     elapsed = time.perf_counter() - t0
-    print("-" * 65)
+    print("-" * 72)
     print(f"\nDone: {total_steps:,} steps in {elapsed:.1f}s  "
           f"({total_steps/elapsed:,.0f} env-steps/sec end-to-end)")
     if score_buf:
